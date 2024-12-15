@@ -39,6 +39,13 @@ func FetchProjects(token, groupName string, excludeProjects []string) ([]Project
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%serror fetching projects: %s%s", Red, resp.Status, Reset)
 		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
+			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
+			time.Sleep(waitDuration) // Wait before retrying
+			continue
+		}
+
 		var projects []Project
 
 		if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
@@ -49,13 +56,6 @@ func FetchProjects(token, groupName string, excludeProjects []string) ([]Project
 				allProjects = append(allProjects, project)
 			}
 		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
-			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
-			time.Sleep(waitDuration) // Wait before retrying
-			continue
-		}
-
 		return allProjects, nil
 
 		// Handle specific error codes
@@ -220,7 +220,14 @@ func FetchJobsCount(token string, projectID int, scope string) (int, []string, e
 		}(resp.Body)
 
 		if resp.StatusCode != http.StatusOK {
-			return 0, nil, fmt.Errorf("%serror fetching %s jobs for project ID %d: name: %s %s%s", Red, scope, projectID, resp.Status, Reset)
+			return 0, nil, fmt.Errorf("%serror fetching %s jobs for project ID %d: name: %s%s", Red, scope, projectID, resp.Status, Reset)
+		}
+		// Handle specific rate-limit
+		if resp.StatusCode == http.StatusTooManyRequests {
+			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
+			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
+			time.Sleep(waitDuration) // Wait before retrying
+			continue
 		}
 
 		var jobs []struct {
@@ -231,13 +238,6 @@ func FetchJobsCount(token string, projectID int, scope string) (int, []string, e
 			return 0, nil, err
 		}
 		return len(jobs), extractTags(jobs), nil
-		// Handle specific error codes
-		if resp.StatusCode == http.StatusTooManyRequests {
-			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
-			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
-			time.Sleep(waitDuration) // Wait before retrying
-			continue
-		}
 	}
 	return 0, nil, fmt.Errorf("%sfailed to fetch job counts after %d attempts%s", Red, maxRetries, Reset)
 }

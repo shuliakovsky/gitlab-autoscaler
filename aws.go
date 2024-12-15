@@ -10,32 +10,54 @@ import (
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 )
 
-var svc *autoscaling.AutoScaling
-
 const (
 	minCapacity = 0 // Constant for ASG min size
 )
 
-func InitializeAWS() {
-	sess := session.Must(session.NewSession())
-	svc = autoscaling.New(sess)
+func NewAWSClient(sess *session.Session) *AWSClient {
+	return &AWSClient{
+		svc: autoscaling.New(sess),
+	}
+}
+func (c *AWSClient) DescribeAutoScalingGroups(input *autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error) {
+	return c.svc.DescribeAutoScalingGroups(input)
 }
 
-func GetCurrentCapacity(asgName string) (int64, error) {
+func NewAWSClients() *AWSClients {
+	return &AWSClients{
+		clients: make(map[string]AWSService),
+	}
+}
+func (a *AWSClients) Get(region string) AWSService {
+	if client, exists := a.clients[region]; exists {
+		return client
+	}
+	client := InitializeAWS(region)
+	a.clients[region] = client
+	return client
+}
+
+func InitializeAWS(region string) AWSService {
+	sess, _ := session.NewSession(&aws.Config{Region: aws.String(region)})
+	return NewAWSClient(sess)
+}
+
+func GetCurrentCapacity(awsService *AWSClient, asgName string) (int64, error) {
+
 	input := &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: aws.StringSlice([]string{asgName}),
 	}
-	result, err := svc.DescribeAutoScalingGroups(input)
+	result, err := awsService.svc.DescribeAutoScalingGroups(input)
 	if err != nil {
-		return 0, fmt.Errorf("%sfailed to describe ASG %s: %w%s", Red, asgName, err, Reset)
+		return 0, fmt.Errorf("failed to describe ASG: %s%s%s. Error: %s%w%s", Red, asgName, Reset, Red, err, Reset)
 	}
 	if len(result.AutoScalingGroups) == 0 {
-		return 0, fmt.Errorf(" %sASG %s not found %s", Red, asgName, Reset)
+		return 0, fmt.Errorf("ASG: %s%s%s not found", Red, asgName, Reset)
 	}
 	return *result.AutoScalingGroups[0].DesiredCapacity, nil
 }
 
-func UpdateASGCapacity(asg AutoScalingGroup, capacity int64, maxCapacity int64) error {
+func UpdateASGCapacity(awsService *AWSClient, asg AutoScalingGroup, capacity int64, maxCapacity int64) error {
 	if capacity > maxCapacity {
 		return fmt.Errorf("cannot update ASG %s%s%s: desired capacity  %s%d%s exceeds max capacity  %s%d%s",
 			LightGray, asg.Name, Reset, Green, capacity, Reset, Green, maxCapacity, Reset)
@@ -47,7 +69,7 @@ func UpdateASGCapacity(asg AutoScalingGroup, capacity int64, maxCapacity int64) 
 		MaxSize:              aws.Int64(capacity),
 		DesiredCapacity:      aws.Int64(capacity),
 	}
-	_, err := svc.UpdateAutoScalingGroup(input)
+	_, err := awsService.svc.UpdateAutoScalingGroup(input)
 	if err != nil {
 		return fmt.Errorf(" %sfailed to update ASG %s: %w%s", Red, asg.Name, err, Reset)
 	}
@@ -55,21 +77,22 @@ func UpdateASGCapacity(asg AutoScalingGroup, capacity int64, maxCapacity int64) 
 	return nil
 }
 
-func HandleASG(asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags,
-	totalRunningWithoutTags int64, allowScalingDownToZero bool, maxCapacity int64, wg *sync.WaitGroup,
-	pendingJobsWithTags map[string]int, runningJobsWithTags map[string]int, totalCapacity *int64) {
-	defer wg.Done()
-	currentCapacity, err := GetCurrentCapacity(asg.Name)
+func HandleASG(awsService *AWSClient, asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags,
+	totalRunningWithoutTags int64, allowScalingDownToZero bool, maxCapacity int64,
+	pendingJobsWithTags map[string]int, runningJobsWithTags map[string]int, totalCapacity *int64, mu *sync.Mutex) {
+	currentCapacity, err := GetCurrentCapacity(awsService, asg.Name)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	*totalCapacity += currentCapacity
 
-	log.Printf("Processing ASG: %s%s%s, Current capacity: %s%d%s, Tags:  %s%v%s",
-		LightGray, asg.Name, Reset, Green, currentCapacity, Reset, Green, asg.Tags, Reset)
+	mu.Lock()
+	*totalCapacity += currentCapacity
+	defer mu.Unlock()
 
 	totalJobs := totalPendingJobs + totalRunningJobs
+	log.Printf("Processing ASG: %s%s%s, Current capacity: %s%d%s, Tags:  %s%v%s",
+		LightGray, asg.Name, Reset, Green, currentCapacity, Reset, Green, asg.Tags, Reset)
 
 	pendingJobMatchingTags := false // pending job with matching tags flag - if true we can't scale down. must check possibility scale up ASG to serve this job
 	pendingJobWithNoTags := false   // pending job with no any tags   flag - if true we can't scale down. must check possibility scale up ASG to serve this job
@@ -111,11 +134,11 @@ func HandleASG(asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutT
 	if totalJobs >= 0 {
 		// in case of matching tags and current capacity is not enough -> try scaling up
 		if pendingJobMatchingTags && int64(len(pendingJobsWithTags))+int64(len(runningJobsWithTags)) > currentCapacity {
-			newCapacity := currentCapacity + 1 // Увеличиваем на 1
+			newCapacity := currentCapacity + 1
 			if newCapacity > maxCapacity {
 				newCapacity = maxCapacity
 			}
-			if err := UpdateASGCapacity(AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
+			if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
 				log.Println(err)
 			} else {
 				log.Printf("Scaling up ASG: %s%s%s, New capacity:  %s%d %s, Reason:  %spending job with matching tags detected %s",
@@ -129,7 +152,7 @@ func HandleASG(asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutT
 			if newCapacity > maxCapacity {
 				newCapacity = maxCapacity
 			}
-			if err := UpdateASGCapacity(AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
+			if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
 				log.Println(err)
 			} else {
 				log.Printf("Scaling up ASG %s%s%s, New capacity:  %s%d%s, Reason:  %spending job with no tags detected %s",
@@ -144,7 +167,7 @@ func HandleASG(asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutT
 			if allowScalingDownToZero {
 				log.Printf("Scaling down ASG: %s by %s1%s, Reason: there is no jobs to serve",
 					asg.Name, Magenta, Reset)
-				if err := UpdateASGCapacity(AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
+				if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
 					log.Println(err)
 				} else {
 					log.Printf("Scaled down ASG %s%s%s, Current capacity:  %s%d %s",
@@ -155,10 +178,11 @@ func HandleASG(asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutT
 	}
 }
 
-func ScaleAutoScalingGroups(asgConfigs []Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags,
-	totalRunningWithoutTags int64, allowScalingDownToZero bool,
-	pendingJobsWithTags map[string]int, runningJobsWithTags map[string]int, totalCapacity *int64) {
+func ScaleAutoScalingGroups(awsClients *AWSClients, asgConfigs []Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags,
+	totalRunningWithoutTags int64, pendingJobsWithTags map[string]int, runningJobsWithTags map[string]int, totalCapacity *int64) {
+
 	var wg sync.WaitGroup
+	mu := &sync.Mutex{}
 
 	for _, asg := range asgConfigs {
 		if len(asg.Tags) == 0 {
@@ -167,8 +191,18 @@ func ScaleAutoScalingGroups(asgConfigs []Asg, totalPendingJobs, totalRunningJobs
 		}
 
 		wg.Add(1)
-		go HandleASG(asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags, totalRunningWithoutTags,
-			allowScalingDownToZero, int64(asg.MaxAsgCapacity), &wg, pendingJobsWithTags, runningJobsWithTags, totalCapacity)
+		go func(asg Asg) {
+			defer wg.Done()
+
+			awsService := awsClients.Get(asg.Region)
+
+			// Perform type assertion here
+			if client, ok := awsService.(*AWSClient); ok {
+				HandleASG(client, asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags, totalRunningWithoutTags, bool(asg.ScaleToZero), int64(asg.MaxAsgCapacity), pendingJobsWithTags, runningJobsWithTags, totalCapacity, mu)
+			} else {
+				log.Printf("Error: awsService is not of type *AWSClient")
+			}
+		}(asg)
 	}
 	wg.Wait()
 }

@@ -1,5 +1,7 @@
 package main
 
+import "github.com/aws/aws-sdk-go/service/autoscaling"
+
 type AutoScalingGroup struct {
 	Name             string
 	MinSize          int64
@@ -11,6 +13,8 @@ type Asg struct {
 	Name           string   `yaml:"name"`
 	Tags           []string `yaml:"tags"`
 	MaxAsgCapacity int      `yaml:"max-asg-capacity"`
+	ScaleToZero    bool     `yaml:"scale-to-zero"`
+	Region         string   `yaml:"region"`
 }
 type GitLabConfig struct {
 	Token           string   `yaml:"token"`
@@ -21,9 +25,7 @@ type AutoscalerConfig struct {
 	CheckInterval int `yaml:"check-interval"`
 }
 type AWSConfig struct {
-	ScaleToZero    bool  `yaml:"scale-to-zero"`
-	MaxAsgCapacity int   `yaml:"max-asg-capacity"`
-	AsgNames       []Asg `yaml:"asg-names"`
+	AsgNames []Asg `yaml:"asg-names"`
 }
 type Config struct {
 	GitLab     GitLabConfig     `yaml:"gitlab"`
@@ -36,3 +38,10 @@ type Project struct {
 	PendingTagList []string `json:"pending_tag_list"`
 	RunningTagList []string `json:"running_tag_list"`
 }
+
+type AWSService interface {
+	DescribeAutoScalingGroups(input *autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
+}
+
+type AWSClient struct{ svc *autoscaling.AutoScaling }
+type AWSClients struct{ clients map[string]AWSService }

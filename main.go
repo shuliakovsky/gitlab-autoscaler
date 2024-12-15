@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 	"log"
 	"os"
 	"strings"
@@ -15,6 +15,12 @@ import (
 var Version string = "0.1.0" //Default Version value
 var CommitHash string = ""
 
+func printVersion() {
+	fmt.Printf("gitlab-autoscaler version: %s\n", Version)
+	if CommitHash != "" {
+		fmt.Printf("commit hash: %s\n", CommitHash)
+	}
+}
 func printHelp() {
 	fmt.Println("Usage:")
 	fmt.Println("  --config <path to config file>     Specify the path to the configuration file.")
@@ -25,14 +31,22 @@ func printConfiguration(config *Config) {
 	border := "═"
 	borderLine := fmt.Sprintf("%s\n", strings.Repeat(string(border), 160))
 	fmt.Print(borderLine)
-	log.Printf("Current Configuration:\n")
-	log.Printf("  Token: %s\n", "hidden")
-	log.Printf("  Group Name: %s\n", config.GitLab.Group)
-	log.Printf("  Check Interval: %d\n", config.Autoscaler.CheckInterval)
-	log.Printf("  Scale to Zero: %t\n", config.AWS.ScaleToZero)
-	log.Printf("  ASG Names:\n")
+	log.Printf("gitlab-autoscaler. version: %s commit hash: %s\n", Version, CommitHash)
+	log.Printf("configuration:\n")
+	if len(config.GitLab.Token) > 0 {
+		log.Printf("  gitlab private token: %s\n", "present")
+	} else {
+		log.Printf("  gitlab private token: %s%s%s\n", Red, "empty", Reset)
+	}
+	if len(config.GitLab.Group) > 0 {
+		log.Printf("  gitlab group name: %s\n", config.GitLab.Group)
+	} else {
+		log.Printf("  gitlab group name: %s%s%s\n", Red, "empty", Reset)
+	}
+	log.Printf("  check interval: %d\n", config.Autoscaler.CheckInterval)
+	log.Printf("  aws asg names:\n")
 	for _, asg := range config.AWS.AsgNames {
-		log.Printf("    - Name: %s, Tags: %v, Max ASG Capacity: %d\n", asg.Name, asg.Tags, asg.MaxAsgCapacity)
+		log.Printf("    - name: %s, tags: %v, max asg capacity: %d, scale to zero: %t\n", asg.Name, asg.Tags, asg.MaxAsgCapacity, asg.ScaleToZero)
 	}
 	fmt.Print(borderLine)
 }
@@ -54,7 +68,22 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	return &config, nil
 }
-
+func setDefaultConfig(config *Config) {
+	if config.Autoscaler.CheckInterval == 0 {
+		config.Autoscaler.CheckInterval = 10
+	}
+	for i := range config.AWS.AsgNames {
+		if config.AWS.AsgNames[i].MaxAsgCapacity == 0 {
+			config.AWS.AsgNames[i].MaxAsgCapacity = 1
+		}
+		if config.AWS.AsgNames[i].Region == "" {
+			config.AWS.AsgNames[i].Region = os.Getenv("AWS_REGION")
+			if config.AWS.AsgNames[i].Region == "" {
+				config.AWS.AsgNames[i].Region = os.Getenv("AWS_DEFAULT_REGION")
+			}
+		}
+	}
+}
 func main() {
 	configPath := flag.String("config", "./config.yml", "Path to the configuration file. Default ./config.yml")
 	help := flag.Bool("help", false, "Show help")
@@ -63,10 +92,7 @@ func main() {
 	borderLine := fmt.Sprintf("%s\n", strings.Repeat(string("="), 160))
 	// version
 	if *version {
-		fmt.Printf("Version: %s\n", Version)
-		if CommitHash != "" {
-			fmt.Printf("Commit Hash: %s\n", CommitHash)
-		}
+		printVersion()
 		return
 	}
 	// help
@@ -82,10 +108,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error loading configuration: %s", err)
 	}
-
-	// print started configuration
+	setDefaultConfig(config)
 	printConfiguration(config)
-	InitializeAWS()
+	awsClients := NewAWSClients()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -111,8 +136,9 @@ func main() {
 				}
 
 				var totalCapacity int64 = 0
-				ScaleAutoScalingGroups(config.AWS.AsgNames, int64(totalPendingJobs), int64(totalRunningJobs),
-					int64(totalPendingWithoutTags), int64(totalRunningWithoutTags), config.AWS.ScaleToZero,
+
+				ScaleAutoScalingGroups(awsClients, config.AWS.AsgNames, int64(totalPendingJobs), int64(totalRunningJobs),
+					int64(totalPendingWithoutTags), int64(totalRunningWithoutTags),
 					pendingJobsWithTags, runningJobsWithTags, &totalCapacity)
 				log.Printf("Total active capacity: %s%-4d%s", Green, totalCapacity, Reset)
 				fmt.Print(borderLine)
