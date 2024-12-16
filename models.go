@@ -43,5 +43,10 @@ type AWSService interface {
 	DescribeAutoScalingGroups(input *autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
 }
 
-type AWSClient struct{ svc *autoscaling.AutoScaling }
-type AWSClients struct{ clients map[string]AWSService }
+type AWSClient struct {
+	svc *autoscaling.AutoScaling
+}
+
+type AWSClients struct {
+	clients map[string]AWSService
+}

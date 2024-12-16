@@ -1,7 +1,5 @@
 package main
 
-import "strings"
-
 // ANSI Colors
 const (
 	Reset     = "\033[0m"
@@ -13,13 +11,3 @@ const (
 	Cyan      = "\033[36m"
 	LightGray = "\033[37m"
 )
-
-func split(s, delimiter string) []string {
-	var result []string
-	for _, item := range strings.Split(s, delimiter) {
-		if trimmed := strings.TrimSpace(item); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
