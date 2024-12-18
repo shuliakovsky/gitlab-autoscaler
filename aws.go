@@ -133,7 +133,7 @@ func HandleASG(awsService *AWSClient, asg Asg, totalPendingJobs, totalRunningJob
 
 	if totalJobs >= 0 {
 		// in case of matching tags and current capacity is not enough -> try scaling up
-		if pendingJobMatchingTags && int64(len(pendingJobsWithTags))+int64(len(runningJobsWithTags)) > currentCapacity {
+		if pendingJobMatchingTags && currentCapacity < maxCapacity {
 			newCapacity := currentCapacity + 1
 			if newCapacity > maxCapacity {
 				newCapacity = maxCapacity
