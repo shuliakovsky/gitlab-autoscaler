@@ -62,7 +62,10 @@ func UpdateASGCapacity(awsService *AWSClient, asg AutoScalingGroup, capacity int
 		return fmt.Errorf("cannot update ASG %s%s%s: desired capacity  %s%d%s exceeds max capacity  %s%d%s",
 			LightGray, asg.Name, Reset, Green, capacity, Reset, Green, maxCapacity, Reset)
 	}
-
+	if capacity < minCapacity {
+		return fmt.Errorf("cannot update ASG %s%s%s: desired capacity  %s%d%s exceeds min capacity  %s%d%s",
+			LightGray, asg.Name, Reset, Green, capacity, Reset, Green, minCapacity, Reset)
+	}
 	input := &autoscaling.UpdateAutoScalingGroupInput{
 		AutoScalingGroupName: aws.String(asg.Name),
 		MinSize:              aws.Int64(capacity),
