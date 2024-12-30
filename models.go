@@ -1,6 +1,8 @@
 package main
 
-import "github.com/aws/aws-sdk-go/service/autoscaling"
+import (
+	"github.com/aws/aws-sdk-go/service/autoscaling"
+)
 
 type AutoScalingGroup struct {
 	Name             string
@@ -44,9 +46,13 @@ type AWSService interface {
 }
 
 type AWSClient struct {
-	svc *autoscaling.AutoScaling
+	svc AutoScalingAPI
 }
 
 type AWSClients struct {
 	clients map[string]AWSService
+}
+type AutoScalingAPI interface {
+	DescribeAutoScalingGroups(*autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
+	UpdateAutoScalingGroup(*autoscaling.UpdateAutoScalingGroupInput) (*autoscaling.UpdateAutoScalingGroupOutput, error)
 }
