@@ -16,6 +16,11 @@ const (
 	maxRetries            = 5
 )
 
+// shared HTTP client with hard timeout to prevent hangs
+var gitlabClient = &http.Client{
+	Timeout: 25 * time.Second,
+}
+
 func FetchProjects(token, groupName string, excludeProjects []string) ([]Project, error) {
 	req, err := http.NewRequest("GET", fmt.Sprintf(gitlabAPIBaseTemplate, groupName)+"?include_subgroups=true&per_page=100", nil)
 	if err != nil {
@@ -25,7 +30,7 @@ func FetchProjects(token, groupName string, excludeProjects []string) ([]Project
 	var allProjects []Project
 	for attempt := 0; attempt < maxRetries; attempt++ {
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := gitlabClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -36,16 +41,15 @@ func FetchProjects(token, groupName string, excludeProjects []string) ([]Project
 			}
 		}(resp.Body)
 
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%serror fetching projects: %s%s", Red, resp.Status, Reset)
-		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
 			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
 			time.Sleep(waitDuration) // Wait before retrying
 			continue
 		}
-
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%serror fetching projects: %s%s", Red, resp.Status, Reset)
+		}
 		var projects []Project
 
 		if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
@@ -68,12 +72,14 @@ func CountPendingJobsWithTags(token string, projects []Project) (map[string]int,
 	runningJobsWithTags := make(map[string]int)
 
 	var wg sync.WaitGroup
-	results := make(chan struct {
-		tags    []string
-		pending int
-		running int
-		err     error
-	}, len(projects))
+	type res struct {
+		pendingTags []string
+		runningTags []string
+		pending     int
+		running     int
+		err         error
+	}
+	results := make(chan res, len(projects))
 
 	for _, project := range projects {
 		wg.Add(1)
@@ -81,47 +87,53 @@ func CountPendingJobsWithTags(token string, projects []Project) (map[string]int,
 			defer wg.Done()
 			pendingJobs, pendingTags, err := FetchJobsCount(token, project.ID, "pending")
 			if err != nil {
-				results <- struct {
-					tags    []string
-					pending int
-					running int
-					err     error
-				}{nil, 0, 0, err}
+				results <- res{err: err}
 				return
 			}
 			runningJobs, runningTags, err := FetchJobsCount(token, project.ID, "running")
 			if err != nil {
-				results <- struct {
-					tags    []string
-					pending int
-					running int
-					err     error
-				}{nil, pendingJobs, 0, err}
+				results <- res{pending: pendingJobs, err: err}
 				return
 			}
-
-			for _, tag := range pendingTags {
-				pendingJobsWithTags[tag] += pendingJobs
+			results <- res{
+				pendingTags: pendingTags,
+				runningTags: runningTags,
+				pending:     pendingJobs,
+				running:     runningJobs,
+				err:         nil,
 			}
-			for _, tag := range runningTags {
-				runningJobsWithTags[tag] += runningJobs
-			}
-			results <- struct {
-				tags    []string
-				pending int
-				running int
-				err     error
-			}{pendingTags, pendingJobs, runningJobs, nil}
 		}(project)
 	}
 	wg.Wait()
 	close(results)
 
-	for result := range results {
-		if result.err != nil {
-			log.Printf("Error: %s", result.err)
+	for r := range results {
+		if r.err != nil {
+			log.Printf("Error: %s", r.err)
+			continue
+		}
+		// Для каждого проекта считаем, сколько раз встречается каждый тег (количество джобов с этим тегом)
+		// и добавляем именно это количество в глобальный агрегат.
+		if len(r.pendingTags) > 0 {
+			local := make(map[string]int)
+			for _, t := range r.pendingTags {
+				local[t]++
+			}
+			for tag, cnt := range local {
+				pendingJobsWithTags[tag] += cnt
+			}
+		}
+		if len(r.runningTags) > 0 {
+			local := make(map[string]int)
+			for _, t := range r.runningTags {
+				local[t]++
+			}
+			for tag, cnt := range local {
+				runningJobsWithTags[tag] += cnt
+			}
 		}
 	}
+
 	return pendingJobsWithTags, runningJobsWithTags
 }
 
@@ -208,7 +220,7 @@ func FetchJobsCount(token string, projectID int, scope string) (int, []string, e
 		}
 		req.Header.Set("PRIVATE-TOKEN", token)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := gitlabClient.Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -219,15 +231,16 @@ func FetchJobsCount(token string, projectID int, scope string) (int, []string, e
 			}
 		}(resp.Body)
 
-		if resp.StatusCode != http.StatusOK {
-			return 0, nil, fmt.Errorf("%serror fetching %s jobs for project ID %d: name: %s%s", Red, scope, projectID, resp.Status, Reset)
-		}
 		// Handle specific rate-limit
 		if resp.StatusCode == http.StatusTooManyRequests {
 			waitDuration := time.Duration(2<<attempt) * time.Second // Exponential backoff
 			log.Printf("Received 429 Too Many Requests. Retrying in %s...", waitDuration)
 			time.Sleep(waitDuration) // Wait before retrying
 			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return 0, nil, fmt.Errorf("%serror fetching %s jobs for project ID %d: name: %s%s", Red, scope, projectID, resp.Status, Reset)
 		}
 
 		var jobs []struct {

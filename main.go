@@ -114,35 +114,55 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// ticker-driven loop to avoid long blocking inside default branch
+	ticker := time.NewTicker(time.Duration(config.Autoscaler.CheckInterval) * time.Second)
+	defer ticker.Stop()
+	// run first iteration immediately to avoid startup delay
+	run := func() {
+		projects, err := FetchProjects(config.GitLab.Token, config.GitLab.Group, config.GitLab.ExcludeProjects)
+		if err != nil {
+			log.Printf("%sError fetching projects: %s%s", Red, err, Reset)
+			fmt.Print(borderLine)
+			return
+		}
+		pendingJobsWithTags, runningJobsWithTags := CountPendingJobsWithTags(config.GitLab.Token, projects)
+		totalPendingJobs, totalRunningJobs, totalPendingWithoutTags, totalRunningWithoutTags, err :=
+			FetchJobCounts(config.GitLab.Token, projects)
+		if err != nil {
+			log.Printf("%sError fetching jobs: %s%s", Red, err, Reset)
+			fmt.Print(borderLine)
+			return
+		}
+		var totalCapacity int64 = 0
+		ScaleAutoScalingGroups(awsClients, config.AWS.AsgNames,
+			int64(totalPendingJobs), int64(totalRunningJobs),
+			int64(totalPendingWithoutTags), int64(totalRunningWithoutTags),
+			pendingJobsWithTags, runningJobsWithTags, &totalCapacity)
+		log.Printf("Total active capacity: %s%-4d%s", Green, totalCapacity, Reset)
+		fmt.Print(borderLine)
+	}
+
+	// optional: warm-up AWS clients for known regions to avoid races/latency on first tick
+	// (safe even без warm-up; это purely perf)
+	regions := make(map[string]struct{})
+	for _, asg := range config.AWS.AsgNames {
+		if asg.Region != "" {
+			regions[asg.Region] = struct{}{}
+		}
+	}
+	for r := range regions {
+		_ = awsClients.Get(r)
+	}
+	// immediate first run (sync)
+	run()
+
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				projects, err := FetchProjects(config.GitLab.Token, config.GitLab.Group, config.GitLab.ExcludeProjects)
-				if err != nil {
-					log.Printf("%sError fetching projects: %s%s", Red, err, Reset)
-					time.Sleep(time.Duration(config.Autoscaler.CheckInterval) * time.Second)
-					continue
-				}
-				pendingJobsWithTags, runningJobsWithTags := CountPendingJobsWithTags(config.GitLab.Token, projects)
-				totalPendingJobs, totalRunningJobs, totalPendingWithoutTags, totalRunningWithoutTags,
-					err := FetchJobCounts(config.GitLab.Token, projects)
-				if err != nil {
-					log.Printf("%sError fetching jobs: %s%s", Red, err, Reset)
-					time.Sleep(time.Duration(config.Autoscaler.CheckInterval) * time.Second)
-					continue
-				}
-
-				var totalCapacity int64 = 0
-
-				ScaleAutoScalingGroups(awsClients, config.AWS.AsgNames, int64(totalPendingJobs), int64(totalRunningJobs),
-					int64(totalPendingWithoutTags), int64(totalRunningWithoutTags),
-					pendingJobsWithTags, runningJobsWithTags, &totalCapacity)
-				log.Printf("Total active capacity: %s%-4d%s", Green, totalCapacity, Reset)
-				fmt.Print(borderLine)
-				time.Sleep(time.Duration(config.Autoscaler.CheckInterval) * time.Second)
+			case <-ticker.C:
+				run()
 			}
 		}
 	}()

@@ -29,10 +29,20 @@ func NewAWSClients() *AWSClients {
 	}
 }
 func (a *AWSClients) Get(region string) AWSService {
+	// fast path: read lock
+	a.mu.RLock()
+	client, exists := a.clients[region]
+	a.mu.RUnlock()
+	if exists {
+		return client
+	}
+	// slow path: write lock + double-check
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if client, exists := a.clients[region]; exists {
 		return client
 	}
-	client := InitializeAWS(region)
+	client = InitializeAWS(region)
 	a.clients[region] = client
 	return client
 }
@@ -42,19 +52,44 @@ func InitializeAWS(region string) AWSService {
 	return NewAWSClient(sess)
 }
 
-func GetCurrentCapacity(awsService *AWSClient, asgName string) (int64, error) {
-
+// GetCurrentCapacity возвращает allocatedCount (InService + Pending*) и desiredCapacity
+func GetCurrentCapacity(awsService *AWSClient, asgName string) (int64, int64, error) {
 	input := &autoscaling.DescribeAutoScalingGroupsInput{
 		AutoScalingGroupNames: aws.StringSlice([]string{asgName}),
 	}
 	result, err := awsService.svc.DescribeAutoScalingGroups(input)
 	if err != nil {
-		return 0, fmt.Errorf("failed to describe ASG: %s%s%s. Error: %s%w%s", Red, asgName, Reset, Red, err, Reset)
+		return 0, 0, fmt.Errorf("failed to describe ASG: %s%s%s. Error: %s%w%s", Red, asgName, Reset, Red, err, Reset)
 	}
 	if len(result.AutoScalingGroups) == 0 {
-		return 0, fmt.Errorf("ASG: %s%s%s not found", Red, asgName, Reset)
+		return 0, 0, fmt.Errorf("ASG: %s%s%s not found", Red, asgName, Reset)
 	}
-	return *result.AutoScalingGroups[0].DesiredCapacity, nil
+
+	asg := result.AutoScalingGroups[0]
+
+	allocatedStates := map[string]bool{
+		"InService":       true,
+		"Pending":         true,
+		"Pending:Wait":    true,
+		"Pending:Proceed": true,
+	}
+
+	var allocatedCount int64 = 0
+	for _, inst := range asg.Instances {
+		if inst == nil || inst.LifecycleState == nil {
+			continue
+		}
+		if allocatedStates[aws.StringValue(inst.LifecycleState)] {
+			allocatedCount++
+		}
+	}
+
+	var desired int64 = 0
+	if asg.DesiredCapacity != nil {
+		desired = aws.Int64Value(asg.DesiredCapacity)
+	}
+
+	return allocatedCount, desired, nil
 }
 
 func UpdateASGCapacity(awsService *AWSClient, asg AutoScalingGroup, capacity int64, maxCapacity int64) error {
@@ -83,37 +118,41 @@ func UpdateASGCapacity(awsService *AWSClient, asg AutoScalingGroup, capacity int
 func HandleASG(awsService *AWSClient, asg Asg, totalPendingJobs, totalRunningJobs, totalPendingWithoutTags,
 	totalRunningWithoutTags int64, allowScalingDownToZero bool, maxCapacity int64,
 	pendingJobsWithTags map[string]int, runningJobsWithTags map[string]int, totalCapacity *int64, mu *sync.Mutex) {
-	currentCapacity, err := GetCurrentCapacity(awsService, asg.Name)
+
+	allocatedCount, desiredCapacity, err := GetCurrentCapacity(awsService, asg.Name)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
+	// Добавляем allocatedCount к общей capacity (allocated учитывает Pending/InService)
 	mu.Lock()
-	*totalCapacity += currentCapacity
-	defer mu.Unlock()
+	*totalCapacity += allocatedCount
+	mu.Unlock()
+
+	log.Printf("Processing ASG: %s%s%s, Desired: %s%d%s, Allocated: %s%d%s, Tags:  %s%v%s",
+		LightGray, asg.Name, Reset, Green, desiredCapacity, Reset, Cyan, allocatedCount, Reset, Green, asg.Tags, Reset)
 
 	totalJobs := totalPendingJobs + totalRunningJobs
-	log.Printf("Processing ASG: %s%s%s, Current capacity: %s%d%s, Tags:  %s%v%s",
-		LightGray, asg.Name, Reset, Green, currentCapacity, Reset, Green, asg.Tags, Reset)
 
-	pendingJobMatchingTags := false // pending job with matching tags flag - if true we can't scale down. must check possibility scale up ASG to serve this job
-	pendingJobWithNoTags := false   // pending job with no any tags   flag - if true we can't scale down. must check possibility scale up ASG to serve this job
-	runningJobMatchingTags := false // running job with matching tags flag - if true we can't scale down.
-	runningJobWithNoTags := false   // running job with no any tags   flag - if true we can't scale down.
+	pendingJobMatchingTags := false
+	pendingJobWithNoTags := false
+	runningJobMatchingTags := false
+	runningJobWithNoTags := false
 
 	// Check pending jobs for pendingJobMatchingTags
-	if totalPendingJobs > 0 { // Only check if there are pending jobs
+	if totalPendingJobs > 0 {
 		for _, tag := range asg.Tags {
 			if count, exists := pendingJobsWithTags[tag]; exists && count > 0 {
-				pendingJobMatchingTags = true // if tags matching switch to true
+				pendingJobMatchingTags = true
 				log.Printf("Found pending job with matching tag: %s, Check if needs to Scaling UP to serve it", tag)
 				break
 			}
 		}
 	}
+
 	// Check running jobs for runningJobMatchingTags
-	if totalRunningJobs > 0 { // Only check if there are pending jobs
+	if totalRunningJobs > 0 {
 		for _, tag := range asg.Tags {
 			if count, exists := runningJobsWithTags[tag]; exists && count > 0 {
 				runningJobMatchingTags = true
@@ -122,50 +161,69 @@ func HandleASG(awsService *AWSClient, asg Asg, totalPendingJobs, totalRunningJob
 			}
 		}
 	}
-	// Check pending jobs for pendingJobWithNoTags
+
+	// Pending without tags
 	if totalPendingWithoutTags > 0 {
-		pendingJobWithNoTags = true // If there are pending jobs without any tag switch to true
+		pendingJobWithNoTags = true
 		log.Printf("Found pending jobs without tag: %d,  Check if needs to Scaling UP to serve it ", totalPendingWithoutTags)
 	}
 
-	// Check pending jobs for runningJobWithNoTags
+	// Running without tags
 	if totalRunningWithoutTags > 0 {
-		runningJobWithNoTags = true // If there are pending jobs without any tag switch to true
+		runningJobWithNoTags = true
 		log.Printf("Found running jobs without tag: %d, Skip Scaling Down ", totalRunningWithoutTags)
 	}
 
-	if totalJobs >= 0 {
-		// in case of matching tags and current capacity is not enough -> try scaling up
-		if pendingJobMatchingTags && currentCapacity < maxCapacity {
-			newCapacity := currentCapacity + 1
-			if newCapacity > maxCapacity {
-				newCapacity = maxCapacity
+	// Если есть задачи — рассматриваем scale-up варианты
+	if totalJobs > 0 {
+		// Scale-up for matching tags
+		if pendingJobMatchingTags && allocatedCount < maxCapacity {
+			var pendingForASG, runningForASG int64
+			for _, tag := range asg.Tags {
+				if c, ok := pendingJobsWithTags[tag]; ok {
+					pendingForASG += int64(c)
+				}
+				if c, ok := runningJobsWithTags[tag]; ok {
+					runningForASG += int64(c)
+				}
 			}
-			if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
-				log.Println(err)
-			} else {
-				log.Printf("Scaling up ASG: %s%s%s, New capacity:  %s%d %s, Reason:  %spending job with matching tags detected %s",
-					LightGray, asg.Name, Reset, Green, newCapacity, Reset, Cyan, Reset)
-			}
-		}
 
-		// in case of pending jobs and current capacity in not enough try scaling up
-		if pendingJobWithNoTags && totalJobs > *totalCapacity {
-			newCapacity := currentCapacity + 1
-			if newCapacity > maxCapacity {
-				newCapacity = maxCapacity
+			// свободные слоты = allocatedCount - runningForASG
+			freeCapacity := allocatedCount - runningForASG
+			if freeCapacity < 0 {
+				freeCapacity = 0
 			}
-			if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, newCapacity, maxCapacity); err != nil {
-				log.Println(err)
+
+			var additionalNeeded int64
+			if pendingForASG > freeCapacity {
+				additionalNeeded = pendingForASG - freeCapacity
+			}
+
+			if additionalNeeded > 0 {
+				proposed := desiredCapacity + additionalNeeded
+				if proposed > maxCapacity {
+					proposed = maxCapacity
+				}
+				if allocatedCount >= proposed {
+					log.Printf("ASG %s: allocated (%d) >= proposed desired (%d), skipping", asg.Name, allocatedCount, proposed)
+				} else {
+					if err := UpdateASGCapacity(awsService, AutoScalingGroup{Name: asg.Name}, proposed, maxCapacity); err != nil {
+						log.Println(err)
+					} else {
+						log.Printf("Scaling up ASG: %s%s%s, Old desired: %s%d%s, New desired:  %s%d %s, Reason: pending=%d running=%d allocated=%d",
+							LightGray, asg.Name, Reset, Green, desiredCapacity, Reset, Green, proposed, Reset, pendingForASG, runningForASG, allocatedCount)
+					}
+				}
 			} else {
-				log.Printf("Scaling up ASG %s%s%s, New capacity:  %s%d%s, Reason:  %spending job with no tags detected %s",
-					LightGray, asg.Name, Reset, Green, newCapacity, Reset, Cyan, Reset)
+				log.Printf("ASG %s: pendingForASG=%d freeCapacity=%d => nothing to increase", asg.Name, pendingForASG, freeCapacity)
 			}
 		}
 	}
-	// in case if no serving task try scaling down
+
+	// Scale-down when нет задач
 	if !pendingJobMatchingTags && !pendingJobWithNoTags && !runningJobMatchingTags && !runningJobWithNoTags {
-		newCapacity := currentCapacity - 1
+		// уменьшаем относительно allocatedCount (видимых инстансов)
+		newCapacity := allocatedCount - 1
 		if newCapacity > minCapacity || (newCapacity == minCapacity && allowScalingDownToZero) {
 			if allowScalingDownToZero {
 				log.Printf("Scaling down ASG: %s by %s1%s, Reason: there is no jobs to serve",

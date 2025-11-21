@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"sync"
 )
 
 type AutoScalingGroup struct {
@@ -50,6 +51,8 @@ type AWSClient struct {
 }
 
 type AWSClients struct {
+	// thread-safe registry of region -> client
+	mu      sync.RWMutex
 	clients map[string]AWSService
 }
 type AutoScalingAPI interface {
