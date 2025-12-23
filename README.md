@@ -4,16 +4,9 @@
 
 ```shell
 # example build for apple macOS & Apple Silicon Chip
-./build.sh darwin arm64
+make build  OS=darwin ARCH=arm64
 ```
-```shell
-# example build for apple macOS & Intel Chip
-./build.sh darwin amd64
-```
-```shell
-# build with no args for help
-./build.sh 
-```
+
 ```shell
 # build with Makefile in docker for apple macOS & Apple Silicon Chip
 make docker-build OS=darwin ARCH=arm64
@@ -61,3 +54,50 @@ gitlab:                                        # GitLab settings
   exclude-projects:                            # except listed in exclude-projects:
     - 'project-without-ci'                     # Node Deployment will not be served  by Autoscaler; that means jobs will not be fetched.
 ```
+
+#### Adding New Providers
+
+To add support for a new cloud provider (e.g., Azure, GCP):
+
+1. Create a new package under `./providers/<provider>` directory
+2. Implement the `Provider` interface from `core/provider.go`:
+   ```go
+   type Provider interface {
+       GetCurrentCapacity(asgName string) (int64, int64, error)
+       UpdateASGCapacity(asgName string, capacity int64) error
+   }
+3. Add a provider-specific implementation in the new package (see ./providers/aws as an example)
+4. Modify main.go to handle your new provider type: 
+    ```go
+    switch strings.ToLower(providerName) {
+    case "aws":
+        // existing AWS implementation
+    case "<new-provider>": 
+        client, err := <NewProvider>.NewClient(defaultRegion)
+        // ...
+    default:
+        log.Fatalf("Unsupported provider '%s'", providerName)
+    }
+    ```
+5. Add documentation about your new provider to the README
+
+#### Contributing
+We welcome contributions from the community! Here's how you can contribute:
+
+1. Fork the repository and create a new branch for your feature/fix
+2. Make sure all tests pass before submitting:
+    ```bash
+    go test ./...
+    ```
+
+3. Write clear commit messages following conventional commits style
+4. Include documentation updates where necessary (especially in README.md)
+5. Submit a pull request with a detailed description of your changes
+
+Please ensure that:
+
+- Your code follows the existing code style
+- You've added appropriate tests for new functionality
+- Your contribution addresses a specific problem or adds a useful feature
+- You've updated documentation to reflect changes
+Thanks for contributing to gitlab-autoscaler!
