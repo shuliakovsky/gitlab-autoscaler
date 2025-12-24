@@ -258,7 +258,7 @@ func TestScaleDown_BlockingByRemainingJobs(t *testing.T) {
 	}
 
 	desiredNoJobs := calculateDesiredCapacity(asg, stateNoJobs, currentCapacity)
-	if desiredNoJobs != 6 { // ИСПРАВЛЕНО: С 5 на 6!
+	if desiredNoJobs != 6 {
 		t.Errorf("Expected 6 (current capacity), got %d", desiredNoJobs)
 	}
 }
