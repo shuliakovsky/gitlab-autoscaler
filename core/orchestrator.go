@@ -45,8 +45,6 @@ func (o *Orchestrator) ScaleASGs(cfg config.Config, state gitlab.ClusterState) {
 		}(asg)
 	}
 	wg.Wait()
-
-	log.Printf("Total active capacity: %s%-4d%s", utils.Green, totalCapacity, utils.Reset)
 }
 
 // scaleASG scales a single auto-scaling group based on job demand
@@ -121,8 +119,10 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 				if err != nil {
 					log.Println(utils.Red, "Scale-up failed:", err, utils.Reset)
 				} else {
-					log.Printf("  → %sScaling up%s ASG: %s, Old desired: %d, New desired: %d",
-						utils.Green, utils.Reset, asg.Name, desiredCapacity, proposed)
+					log.Printf("  → %sScaling up%s ASG: %s%s%s, Old desired: %d, New desired: %d",
+						utils.Green, utils.Reset,
+						utils.LightGray, asg.Name, utils.Reset,
+						desiredCapacity, proposed)
 				}
 			}
 		}
@@ -140,8 +140,10 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 			if err != nil {
 				log.Println(utils.Red, "Scale-down failed:", err, utils.Reset)
 			} else {
-				log.Printf("  → %sScaling down%s ASG: %s, New capacity: %d",
-					utils.Magenta, utils.Reset, asg.Name, newCapacity)
+				log.Printf("  → %sScaling down%s ASG: %s%s%s, New capacity: %d",
+					utils.Magenta, utils.Reset,
+					utils.LightGray, asg.Name, utils.Reset,
+					newCapacity)
 			}
 		}
 	}
@@ -157,10 +159,10 @@ func Run(cfg *config.Config, orchestrator *Orchestrator) {
 		return
 	}
 
-	state := gitlab.CalculateClusterState(projects)
+	state := gitlab.CalculateClusterState(cfg.GitLab.Token, projects)
 	orchestrator.ScaleASGs(*cfg, state)
 
-	log.Printf("Total active capacity: %s%-4d%s", utils.Green, *state.TotalCapacity, utils.Reset)
+	log.Printf("Total active capacity: %s%-4d%s", utils.Green, state.TotalCapacity, utils.Reset)
 
 	PrintSeparator()
 }

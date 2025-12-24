@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/shuliakovsky/gitlab-autoscaler/utils"
@@ -28,7 +29,7 @@ type ClusterState struct {
 	PendingJobsWithTags map[string]int
 	RunningJobsWithTags map[string]int
 	Projects            []Project
-	TotalCapacity       *int64
+	TotalCapacity       int64
 }
 
 // Project represents a GitLab project with job information
@@ -90,28 +91,169 @@ func FetchProjects(token, groupName string, excludeProjects []string) ([]Project
 	return nil, fmt.Errorf("failed to fetch projects after %d attempts", maxRetries)
 }
 
-// CalculateClusterState aggregates job information across all projects
-func CalculateClusterState(projects []Project) ClusterState {
-	state := ClusterState{
-		PendingJobsWithTags: make(map[string]int),
-		RunningJobsWithTags: make(map[string]int),
-		TotalCapacity:       new(int64),
+// FetchJobsCount fetches job counts for a specific scope (pending/running)
+func FetchJobsCount(token string, projectID int, scope string) (int, []string, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf(jobsAPIBaseTemplate, projectID, scope), nil)
+	if err != nil {
+		return 0, nil, err
 	}
+	req.Header.Set("PRIVATE-TOKEN", token)
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err := gitlabClient.Do(req)
+		if err != nil {
+			return 0, nil, err
+		}
+		defer closeBody(resp.Body)
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			waitDuration := time.Duration(2<<attempt) * time.Second
+			log.Printf("%sReceived 429 Too Many Requests. Retrying in %s...%s", utils.Yellow, waitDuration, utils.Reset)
+			time.Sleep(waitDuration)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return 0, nil, fmt.Errorf("error fetching %s jobs for project ID %d: status=%s", scope, projectID, resp.Status)
+		}
+
+		var jobs []struct {
+			ID   int      `json:"id"`
+			Tags []string `json:"tag_list"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+			return 0, nil, err
+		}
+
+		tags := extractTags(jobs)
+		return len(jobs), tags, nil
+	}
+	return 0, nil, fmt.Errorf("failed to fetch job counts after %d attempts", maxRetries)
+}
+
+// CalculateClusterState aggregates job information across all projects (exactly like in the old working version)
+func CalculateClusterState(token string, projects []Project) ClusterState {
+	pendingJobsWithTags := make(map[string]int)
+	runningJobsWithTags := make(map[string]int)
+	var totalPending, totalRunning int64 = 0, 0
+	var totalPendingWithoutTags, totalRunningWithoutTags int
+
+	var wg sync.WaitGroup
+	results := make(chan struct {
+		name        string
+		id          int
+		pending     int
+		running     int
+		pendingTags []string
+		runningTags []string
+		err         error
+	}, len(projects))
 
 	for _, project := range projects {
-		state.TotalPendingJobs += int64(len(project.PendingTagList))
-		state.TotalRunningJobs += int64(len(project.RunningTagList))
+		wg.Add(1)
+		go func(p Project) {
+			defer wg.Done()
+			pendingJobs, pendingTags, err := FetchJobsCount(token, p.ID, "pending")
+			if err != nil {
+				results <- struct {
+					name        string
+					id          int
+					pending     int
+					running     int
+					pendingTags []string
+					runningTags []string
+					err         error
+				}{name: p.Name, id: p.ID, pending: 0, running: 0, err: err}
+				return
+			}
 
-		for _, tag := range project.PendingTagList {
-			state.PendingJobsWithTags[tag]++
-		}
+			runningJobs, runningTags, err := FetchJobsCount(token, p.ID, "running")
+			if err != nil {
+				results <- struct {
+					name        string
+					id          int
+					pending     int
+					running     int
+					pendingTags []string
+					runningTags []string
+					err         error
+				}{name: p.Name, id: p.ID, pending: pendingJobs, running: 0, err: err}
+				return
+			}
 
-		for _, tag := range project.RunningTagList {
-			state.RunningJobsWithTags[tag]++
-		}
+			results <- struct {
+				name        string
+				id          int
+				pending     int
+				running     int
+				pendingTags []string
+				runningTags []string
+				err         error
+			}{
+				name:        p.Name,
+				id:          p.ID,
+				pending:     pendingJobs,
+				running:     runningJobs,
+				pendingTags: pendingTags,
+				runningTags: runningTags,
+				err:         nil,
+			}
+		}(project)
 	}
 
-	return state
+	wg.Wait()
+	close(results)
+
+	for r := range results {
+		if r.err != nil {
+			log.Printf("Error processing project: %s", r.err)
+			continue
+		}
+		totalPending += int64(r.pending)
+		totalRunning += int64(r.running)
+
+		if len(r.pendingTags) == 0 {
+			totalPendingWithoutTags += r.pending
+		}
+		if len(r.runningTags) == 0 {
+			totalRunningWithoutTags += r.running
+		}
+
+		for _, tag := range r.pendingTags {
+			pendingJobsWithTags[tag]++
+		}
+
+		for _, tag := range r.runningTags {
+			runningJobsWithTags[tag]++
+		}
+
+		log.Printf("Project: %-35s (ID: %-9d)  Pending jobs: %s%-3d%s tags: %s%v%s. Running jobs: %s%-3d%s tags: %s%v%s",
+			r.name, r.id,
+			utils.Cyan, r.pending, utils.Reset,
+			utils.Cyan, r.pendingTags, utils.Reset,
+			utils.Green, r.running, utils.Reset,
+			utils.Green, r.runningTags, utils.Reset)
+	}
+
+	return ClusterState{
+		TotalPendingJobs:    totalPending,
+		TotalRunningJobs:    totalRunning,
+		PendingJobsWithTags: pendingJobsWithTags,
+		RunningJobsWithTags: runningJobsWithTags,
+		TotalCapacity:       totalPending + totalRunning,
+	}
+}
+
+// extractTags extracts all tags from job list
+func extractTags(jobs []struct {
+	ID   int      `json:"id"`
+	Tags []string `json:"tag_list"`
+}) []string {
+	var allTags []string
+	for _, job := range jobs {
+		allTags = append(allTags, job.Tags...)
+	}
+	return allTags
 }
 
 // closeBody closes HTTP response body safely
