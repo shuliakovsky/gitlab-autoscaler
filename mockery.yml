@@ -1,0 +1,9 @@
+resolve-type-alias: false
+disable-version-string: true
+issue-845-fix: true
+
+packages:
+  github.com/shuliakovsky/gitlab-autoscaler/providers/aws:
+    interfaces:
+      AutoscalingAPI:
+        filename: aws_autoscaling_api_mock.go

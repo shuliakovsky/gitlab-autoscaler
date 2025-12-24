@@ -41,7 +41,7 @@ else ifneq ($(OS),)
 	$(error Unsupported operating system: $(OS). Supported: darwin, linux)
 endif
 
-.PHONY: all clean docker-build tests check-params
+.PHONY: all clean docker-build tests check-params mock
 
 all: check-params build
 
@@ -78,3 +78,9 @@ clean:
 # Run the full Go test suite with race detector enabled.
 tests:
 	go test -race ./... -v -count=1
+
+# Mock generation for AWS SDK
+mock:
+	@echo "Generating mocks..."
+	@mkdir -p ./providers/aws/mocks
+	@/bin/bash -c "mockery --config mockery.yml"

@@ -12,6 +12,8 @@ import (
 	"github.com/shuliakovsky/gitlab-autoscaler/core"
 )
 
+const minCapacity = 0
+
 func NewAWSClient(region string) (core.Provider, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(region),

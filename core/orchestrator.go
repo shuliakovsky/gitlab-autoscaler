@@ -31,7 +31,6 @@ func (o *Orchestrator) ScaleASGs(cfg config.Config, state gitlab.ClusterState) {
 	mu := &sync.Mutex{}
 	totalCapacity := int64(0)
 
-	// Получаем все ASG из всех провайдеров
 	allAsgs := []config.Asg{}
 	for _, providerConfig := range cfg.Providers {
 		allAsgs = append(allAsgs, providerConfig.AsgNames...)
@@ -71,7 +70,7 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 	*totalCapacity += allocatedCount
 	mu.Unlock()
 
-	log.Printf("Processing ASG: %s%s%s, Desired: %s%d%s, Allocated: %s%d%s, Tags:  %s%v%s",
+	log.Printf("Processing ASG: %s%-30s%s Desired: %s%-3d%s Allocated: %s%-3d%s Tags:  %s%v%s",
 		utils.LightGray, asg.Name, utils.Reset,
 		utils.Green, desiredCapacity, utils.Reset,
 		utils.Cyan, allocatedCount, utils.Reset,
