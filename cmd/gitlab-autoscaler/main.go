@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/shuliakovsky/gitlab-autoscaler/config"
@@ -19,6 +24,8 @@ var CommitHash string = ""   // Default Commit Hash empty
 
 func main() {
 	configPath := flag.String("config", "./config.yml", "Path to the configuration file")
+	reloadFlag := flag.Bool("r", false, "Validate config and send SIGHUP to running process (or self)")
+	pidFile := flag.String("pid-file", "./gitlab-autoscaler.pid", "Path to pidfile")
 	versionFlag := flag.Bool("version", false, "Display application version")
 	helpFlag := flag.Bool("help", false, "Show help message")
 
@@ -37,28 +44,170 @@ func main() {
 		return
 	}
 
+	// If -r: validate config first, then send SIGHUP to pidfile (or self)
+	if *reloadFlag {
+		cfg, err := config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+		if err := cfg.Validate(); err != nil {
+			log.Fatalf("Config validation failed: %v", err)
+		}
+
+		pid, err := readPidFile(*pidFile)
+		if err != nil {
+			// pidfile not found — send SIGHUP to self
+			log.Printf("pidfile not found (%s), sending SIGHUP to self", *pidFile)
+			pid = os.Getpid()
+		} else {
+			log.Printf("Sending SIGHUP to pid %d", pid)
+		}
+
+		if err := sendHUPToPID(pid); err != nil {
+			log.Fatalf("Failed to send SIGHUP to pid %d: %v", pid, err)
+		}
+		log.Printf("Reload signal sent successfully")
+		return
+	}
+
+	// Normal start: write pidfile
+	if err := writePidFile(*pidFile); err != nil {
+		log.Fatalf("Failed to write pidfile: %v", err)
+	}
+	defer func() {
+		_ = os.Remove(*pidFile)
+	}()
+
+	// Load and validate config
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
-
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
-	config.PrintConfiguration(cfg, Version, CommitHash)
+	// Build initial providers and asg mapping (keeps original behavior)
+	providers, asgToProvider, err := buildProvidersFromConfig(cfg)
+	if err != nil {
+		log.Fatalf("Failed to build providers: %v", err)
+	}
 
-	// Create all available providers
+	orchestrator := core.NewOrchestrator(providers, asgToProvider)
+
+	// Context and signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		// debounce: not more often than once per second
+		var lastReload time.Time
+		minInterval := time.Second
+		for {
+			select {
+			case s := <-sigCh:
+				switch s {
+				case syscall.SIGHUP:
+					if time.Since(lastReload) < minInterval {
+						log.Printf("Reload suppressed (debounce)")
+						continue
+					}
+					lastReload = time.Now()
+					log.Printf("Received SIGHUP: reloading config")
+					newCfg, err := config.Load(*configPath)
+					if err != nil {
+						log.Printf("Config load failed: %v", err)
+						continue
+					}
+					if err := newCfg.Validate(); err != nil {
+						log.Printf("Config validation failed: %v", err)
+						continue
+					}
+
+					// Build new providers (initialization happens here)
+					newProviders, newAsgToProvider, err := buildProvidersFromConfig(newCfg)
+					if err != nil {
+						log.Printf("Failed to initialize providers for new config: %v", err)
+						continue
+					}
+
+					// Atomically swap providers in orchestrator
+					orchestrator.SetProviders(newProviders, newAsgToProvider)
+					// Update cfg used by ticker loop below
+					cfg = newCfg
+
+					log.Printf("Config reloaded successfully")
+				case syscall.SIGINT, syscall.SIGTERM:
+					log.Printf("Shutdown signal received")
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Main loop
+	ticker := time.NewTicker(time.Duration(cfg.Autoscaler.CheckInterval) * time.Second)
+	defer ticker.Stop()
+
+	core.Run(cfg, orchestrator)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Exiting")
+			return
+		case <-ticker.C:
+			core.Run(cfg, orchestrator)
+		}
+	}
+}
+
+func printHelp() {
+	fmt.Println("Usage:")
+	fmt.Println("  --config <path to config file>     Specify the path to the configuration file.")
+	fmt.Println("  -r                                 Validate config and send SIGHUP to running process (or self).")
+	fmt.Println("  --pid-file <path>                  Path to pidfile (default ./gitlab-autoscaler.pid).")
+	fmt.Println("  --version                          Display application version.")
+	fmt.Println("  --help                             Show help message.")
+}
+
+func writePidFile(path string) error {
+	pid := os.Getpid()
+	return ioutil.WriteFile(path, []byte(strconv.Itoa(pid)), 0644)
+}
+
+func readPidFile(path string) (int, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+func sendHUPToPID(pid int) error {
+	return syscall.Kill(pid, syscall.SIGHUP)
+}
+
+func buildProvidersFromConfig(cfg *config.Config) (map[string]core.Provider, map[string]string, error) {
 	providers := make(map[string]core.Provider)
-	asgToProvider := make(map[string]string) // Maps ASG name to provider
+	asgToProvider := make(map[string]string)
 
-	// Process ALL providers (not just AWS)
-	for providerName, config := range cfg.Providers {
-		if len(config.AsgNames) == 0 {
-			continue // Skip empty providers
+	for providerName, providerCfg := range cfg.Providers {
+		if len(providerCfg.AsgNames) == 0 {
+			continue
 		}
 
-		defaultRegion := config.Region
+		defaultRegion := providerCfg.Region
 		if defaultRegion == "" {
 			defaultRegion = os.Getenv("AWS_REGION")
 			if defaultRegion == "" {
@@ -66,41 +215,21 @@ func main() {
 			}
 		}
 
-		var providerClient core.Provider
 		switch strings.ToLower(providerName) {
 		case "aws":
 			client, err := aws.NewAWSClient(defaultRegion)
 			if err != nil {
-				log.Fatalf("Failed to initialize %s client: %v", providerName, err)
+				return nil, nil, fmt.Errorf("failed to initialize %s client: %w", providerName, err)
 			}
-			providerClient = client
+			providers[providerName] = client
 		default:
-			log.Fatalf("Unsupported provider '%s'", providerName)
+			return nil, nil, fmt.Errorf("unsupported provider '%s'", providerName)
 		}
 
-		providers[providerName] = providerClient
-
-		// Link each ASG name to its provider
-		for _, asg := range config.AsgNames {
+		for _, asg := range providerCfg.AsgNames {
 			asgToProvider[asg.Name] = providerName
 		}
 	}
 
-	orchestrator := core.NewOrchestrator(providers, asgToProvider)
-
-	ticker := time.NewTicker(time.Duration(cfg.Autoscaler.CheckInterval) * time.Second)
-	defer ticker.Stop()
-
-	core.Run(cfg, orchestrator)
-
-	for range ticker.C {
-		core.Run(cfg, orchestrator)
-	}
-}
-
-func printHelp() {
-	fmt.Println("Usage:")
-	fmt.Println("  --config <path to config file>     Specify the path to the configuration file.")
-	fmt.Println("  --version                          Display application version.")
-	fmt.Println("  --help                             Show help message.")
+	return providers, asgToProvider, nil
 }

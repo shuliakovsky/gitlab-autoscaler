@@ -16,18 +16,21 @@ make docker-build OS=darwin ARCH=arm64
 
 ```unit file (systemd)
 [Unit]
-  Description=Gitlab autoscaler
-  Wants=network-online.target
-  After=network-online.target
+Description=GitLab Autoscaler
+After=network.target
 
 [Service]
-
-  ExecStart=/usr/local/bin/gitlab-autoscaler --config /etc/gitlab-autoscaler/config.yml
-  SyslogIdentifier=gitlab-autoscaler
-  Restart=always
+Type=simple
+User=gitlab-autoscaler
+Group=gitlab-autoscaler
+ExecStart=/usr/local/bin/gitlab-autoscaler -config /etc/gitlab-autoscaler/config.yml -pid-file /var/run/gitlab-autoscaler.pid
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+PIDFile=/var/run/gitlab-autoscaler.pid
 
 [Install]
-  WantedBy=multi-user.target
+WantedBy=multi-user.target
+
 
 ```
 ####  ./config.yml example

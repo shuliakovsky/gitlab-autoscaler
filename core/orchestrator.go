@@ -13,6 +13,7 @@ import (
 
 // Orchestrator manages the scaling of auto-scaling groups based on job demand
 type Orchestrator struct {
+	mu            sync.RWMutex
 	providers     map[string]Provider
 	asgToProvider map[string]string // Maps ASG name to provider name (aws, azure, etc.)
 }
@@ -172,4 +173,13 @@ func PrintSeparator() {
 	lineLength := 160
 	separator := fmt.Sprintf("%s\n", strings.Repeat(string(border), lineLength))
 	log.Print(separator)
+}
+
+// SetProviders atomically replaces orchestrator providers and asg->provider mapping.
+// This is intentionally minimal: provider creation stays outside (main), so no refactor.
+func (o *Orchestrator) SetProviders(newProviders map[string]Provider, newAsgToProvider map[string]string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.providers = newProviders
+	o.asgToProvider = newAsgToProvider
 }
