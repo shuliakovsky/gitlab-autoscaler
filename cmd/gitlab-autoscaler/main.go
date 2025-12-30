@@ -22,12 +22,20 @@ import (
 var Version string = "0.1.0" // Default Version value
 var CommitHash string = ""   // Default Commit Hash empty
 
+const (
+	systemConfigPath = "/etc/gitlab-autoscaler/config.yml"
+	systemPidPath    = "/var/run/gitlab-autoscaler.pid"
+	localConfigPath  = "./config.yml"
+	localPidPath     = "./gitlab-autoscaler.pid"
+)
+
 func main() {
-	configPath := flag.String("config", "./config.yml", "Path to the configuration file")
-	reloadFlag := flag.Bool("r", false, "Validate config and send SIGHUP to running process (or self)")
-	pidFile := flag.String("pid-file", "./gitlab-autoscaler.pid", "Path to pidfile")
-	versionFlag := flag.Bool("version", false, "Display application version")
+	// Flags: allow explicit override; resolution happens after parsing
+	configFlag := flag.String("config", "", "Path to the configuration file (explicit overrides discovery)")
 	helpFlag := flag.Bool("help", false, "Show help message")
+	pidFileFlag := flag.String("pid-file", "", "Path to pidfile (explicit overrides discovery)")
+	reloadFlag := flag.Bool("r", false, "Validate config and send SIGHUP to running process (or self)")
+	versionFlag := flag.Bool("version", false, "Display application version")
 
 	flag.Parse()
 
@@ -44,23 +52,30 @@ func main() {
 		return
 	}
 
+	// Resolve config and pidfile paths by priority:
+	// 1) explicit flag
+	// 2) system path if exists
+	// 3) local path fallback
+	configPath := resolveConfigPath(*configFlag)
+	pidFile := resolvePidFilePath(*pidFileFlag)
+
 	// If -r: validate config first, then send SIGHUP to pidfile (or self)
 	if *reloadFlag {
-		cfg, err := config.Load(*configPath)
+		cfg, err := config.Load(configPath)
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			log.Fatalf("Failed to load config (%s): %v", configPath, err)
 		}
 		if err := cfg.Validate(); err != nil {
 			log.Fatalf("Config validation failed: %v", err)
 		}
 
-		pid, err := readPidFile(*pidFile)
+		pid, err := readPidFile(pidFile)
 		if err != nil {
 			// pidfile not found — send SIGHUP to self
-			log.Printf("pidfile not found (%s), sending SIGHUP to self", *pidFile)
+			log.Printf("pidfile not found (%s), sending SIGHUP to self", pidFile)
 			pid = os.Getpid()
 		} else {
-			log.Printf("Sending SIGHUP to pid %d", pid)
+			log.Printf("Sending SIGHUP to pid %d (pidfile: %s)", pid, pidFile)
 		}
 
 		if err := sendHUPToPID(pid); err != nil {
@@ -71,17 +86,17 @@ func main() {
 	}
 
 	// Normal start: write pidfile
-	if err := writePidFile(*pidFile); err != nil {
+	if err := writePidFile(pidFile); err != nil {
 		log.Fatalf("Failed to write pidfile: %v", err)
 	}
 	defer func() {
-		_ = os.Remove(*pidFile)
+		_ = os.Remove(pidFile)
 	}()
 
 	// Load and validate config
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("Failed to load config (%s): %v", configPath, err)
 	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
@@ -117,7 +132,7 @@ func main() {
 					}
 					lastReload = time.Now()
 					log.Printf("Received SIGHUP: reloading config")
-					newCfg, err := config.Load(*configPath)
+					newCfg, err := config.Load(configPath)
 					if err != nil {
 						log.Printf("Config load failed: %v", err)
 						continue
@@ -170,11 +185,41 @@ func main() {
 
 func printHelp() {
 	fmt.Println("Usage:")
-	fmt.Println("  --config <path to config file>     Specify the path to the configuration file.")
+	fmt.Println("  --config <path to config file>     Specify the path to the configuration file (explicit overrides discovery).")
 	fmt.Println("  -r                                 Validate config and send SIGHUP to running process (or self).")
-	fmt.Println("  --pid-file <path>                  Path to pidfile (default ./gitlab-autoscaler.pid).")
+	fmt.Println("  --pid-file <path>                  Path to pidfile (explicit overrides discovery).")
 	fmt.Println("  --version                          Display application version.")
 	fmt.Println("  --help                             Show help message.")
+}
+
+// resolveConfigPath chooses config path by priority: explicit -> system if exists -> local
+func resolveConfigPath(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if fileExists(systemConfigPath) {
+		return systemConfigPath
+	}
+	return localConfigPath
+}
+
+// resolvePidFilePath chooses pidfile path by priority: explicit -> system if exists -> local
+func resolvePidFilePath(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if fileExists(systemPidPath) {
+		return systemPidPath
+	}
+	return localPidPath
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func writePidFile(path string) error {
