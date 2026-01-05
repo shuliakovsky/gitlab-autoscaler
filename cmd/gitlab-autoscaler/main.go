@@ -32,13 +32,17 @@ const (
 func main() {
 	// Flags: allow explicit override; resolution happens after parsing
 	configFlag := flag.String("config", "", "Path to the configuration file (explicit overrides discovery)")
+	flag.StringVar(configFlag, "c", "", "Alias for -config")
 	helpFlag := flag.Bool("help", false, "Show help message")
+	flag.BoolVar(helpFlag, "h", false, "Alias for -help")
 	pidFileFlag := flag.String("pid-file", "", "Path to pidfile (explicit overrides discovery)")
-	reloadFlag := flag.Bool("r", false, "Validate config and send SIGHUP to running process (or self)")
+	flag.StringVar(pidFileFlag, "p", "", "Alias for -pid-file")
+	reloadFlag := flag.Bool("reload", false, "Validate config and signal the running process to reload and apply updated configuration")
+	flag.BoolVar(reloadFlag, "r", false, "Alias for -reload")
 	versionFlag := flag.Bool("version", false, "Display application version")
+	flag.BoolVar(versionFlag, "v", false, "Alias for -version")
 
 	flag.Parse()
-
 	if *versionFlag {
 		fmt.Printf("gitlab-autoscaler version: %s\n", Version)
 		if CommitHash != "" {
@@ -185,11 +189,11 @@ func main() {
 
 func printHelp() {
 	fmt.Println("Usage:")
-	fmt.Println("  --config <path to config file>     Specify the path to the configuration file (explicit overrides discovery).")
-	fmt.Println("  -r                                 Validate config and send SIGHUP to running process (or self).")
-	fmt.Println("  --pid-file <path>                  Path to pidfile (explicit overrides discovery).")
-	fmt.Println("  --version                          Display application version.")
-	fmt.Println("  --help                             Show help message.")
+	fmt.Println("  -c, --config <path>       Specify the path to the configuration file")
+	fmt.Println("  -p, --pid-file <path>     Path to pidfile")
+	fmt.Println("  -r, --reload              Validate config and signal the running process to reload and apply updated configuration")
+	fmt.Println("  -v, --version             Display application version")
+	fmt.Println("  -h, --help                Show help message")
 }
 
 // resolveConfigPath chooses config path by priority: explicit -> system if exists -> local
