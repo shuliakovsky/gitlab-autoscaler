@@ -34,7 +34,10 @@ func (o *Orchestrator) ScaleASGs(cfg config.Config, state gitlab.ClusterState) {
 
 	allAsgs := []config.Asg{}
 	for _, providerConfig := range cfg.Providers {
-		allAsgs = append(allAsgs, providerConfig.AsgNames...)
+		for _, asg := range providerConfig.AsgNames {
+			asg.Region = asg.EffectiveRegion(providerConfig.Region)
+			allAsgs = append(allAsgs, asg)
+		}
 	}
 
 	for _, asg := range allAsgs {
@@ -61,7 +64,7 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 		return
 	}
 
-	allocatedCount, desiredCapacity, err := provider.GetCurrentCapacity(asg.Name)
+	allocatedCount, desiredCapacity, err := provider.GetCurrentCapacity(asg.Name, asg.Region)
 	if err != nil {
 		log.Println(utils.Red, "Error:", err, utils.Reset)
 		return
@@ -71,8 +74,9 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 	*totalCapacity += allocatedCount
 	mu.Unlock()
 
-	log.Printf("Processing ASG: %s%-30s%s Desired: %s%-3d%s Allocated: %s%-3d%s Tags:  %s%v%s",
+	log.Printf("Processing ASG: %s%-30s%s Region: %s%-12s%s Desired: %s%-3d%s Allocated: %s%-3d%s Tags:  %s%v%s",
 		utils.LightGray, asg.Name, utils.Reset,
+		utils.Cyan, asg.Region, utils.Reset,
 		utils.Green, desiredCapacity, utils.Reset,
 		utils.Cyan, allocatedCount, utils.Reset,
 		utils.Green, asg.Tags, utils.Reset)
@@ -115,7 +119,7 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 			}
 
 			if allocatedCount < proposed {
-				err := provider.UpdateASGCapacity(asg.Name, proposed)
+				err := provider.UpdateASGCapacity(asg.Name, proposed, asg.Region)
 				if err != nil {
 					log.Println(utils.Red, "Scale-up failed:", err, utils.Reset)
 				} else {
@@ -136,7 +140,7 @@ func (o *Orchestrator) scaleASG(asg config.Asg, state gitlab.ClusterState, mu *s
 		}
 
 		if newCapacity >= minAllowed {
-			err := provider.UpdateASGCapacity(asg.Name, newCapacity)
+			err := provider.UpdateASGCapacity(asg.Name, newCapacity, asg.Region)
 			if err != nil {
 				log.Println(utils.Red, "Scale-down failed:", err, utils.Reset)
 			} else {

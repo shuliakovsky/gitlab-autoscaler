@@ -34,3 +34,14 @@ type Asg struct {
 	ScaleToZero    bool     `yaml:"scale-to-zero"`    // Whether the ASG can be scaled down to zero instances
 	Region         string   `yaml:"region"`           // Region where this specific ASG is located (overrides provider default if set)
 }
+
+// EffectiveRegion returns the region to use for this ASG according to config
+// precedence: the ASG-level region always wins over the provider-level default.
+// It intentionally does not fall back to environment variables — that fallback
+// is provider-specific and handled inside the corresponding cloud client.
+func (a Asg) EffectiveRegion(providerDefaultRegion string) string {
+	if a.Region != "" {
+		return a.Region
+	}
+	return providerDefaultRegion
+}

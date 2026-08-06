@@ -256,17 +256,21 @@ func buildProvidersFromConfig(cfg *config.Config) (map[string]core.Provider, map
 			continue
 		}
 
-		defaultRegion := providerCfg.Region
-		if defaultRegion == "" {
-			defaultRegion = os.Getenv("AWS_REGION")
-			if defaultRegion == "" {
-				defaultRegion = "us-east-1"
-			}
-		}
-
 		switch strings.ToLower(providerName) {
 		case "aws":
-			client, err := aws.NewAWSClient(defaultRegion)
+			fallbackRegion := providerCfg.Region
+			if fallbackRegion == "" {
+				fallbackRegion = os.Getenv("AWS_REGION")
+			}
+			if fallbackRegion == "" {
+				fallbackRegion = os.Getenv("AWS_DEFAULT_REGION")
+			}
+			sdkInitRegion := fallbackRegion
+			if sdkInitRegion == "" {
+				sdkInitRegion = "us-east-1"
+			}
+
+			client, err := aws.NewAWSClient(sdkInitRegion)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to initialize %s client: %w", providerName, err)
 			}

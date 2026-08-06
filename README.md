@@ -1,4 +1,5 @@
 # gitlab-autoscaler
+GitLab Autoscaler is a lightweight service that dynamically adjusts the capacity of GitLab Runner Auto Scaling Groups based on real-time CI job demand. It monitors pending and running jobs, matches them to ASG tags, and scales AWS Auto Scaling Groups up or down accordingly. The service supports hot‑reload of configuration via SIGHUP, multi‑provider architecture, and safe concurrent scaling operations.
 
 #### how to build
 
